@@ -1,0 +1,57 @@
+# FactoryMind Default Configuration
+# ------------------------------------
+
+simulation:
+  num_machines: 100
+  duration_steps: 1000
+  sampling_interval_s: 60        # 1 minute between readings
+  seed: 42
+  noise_std: 0.5
+  sensor_drift_rate: 0.001       # per step
+  dropout_probability: 0.01
+  stuck_probability: 0.005
+  outlier_probability: 0.005
+
+sensors:
+  # Nominal operating ranges (min, max) for healthy machines
+  temperature: [65.0, 85.0]      # °C
+  vibration: [1.0, 4.0]          # mm/s RMS
+  pressure: [4.5, 6.0]           # bar
+  motor_current: [8.0, 14.0]    # A
+  rpm: [1450, 1550]              # rev/min
+  load: [40.0, 70.0]             # %
+  coolant_temperature: [25.0, 35.0]  # °C
+  coolant_flow: [8.0, 12.0]     # L/min
+  acoustic_level: [65.0, 80.0]   # dB
+
+detection:
+  rules:
+    temperature_warn: 90.0
+    temperature_critical: 100.0
+    vibration_warn: 5.5
+    vibration_critical: 8.0
+    motor_current_warn: 16.0
+    motor_current_critical: 20.0
+    coolant_temp_warn: 40.0
+    coolant_temp_critical: 50.0
+    pressure_low_warn: 3.5
+    pressure_low_critical: 2.5
+    acoustic_warn: 85.0
+    acoustic_critical: 95.0
+  rolling_window: 10
+
+degradation:
+  early_threshold: 0.2
+  developing_threshold: 0.5
+  severe_threshold: 0.75
+  critical_threshold: 0.95
+
+policy:
+  approval_timeout_s: 300       # 5 minutes
+  max_concurrent_actions: 5
+  allow_auto_shutdown: false      # human approval always required for shutdown
+
+audit:
+  hash_algorithm: sha256
+  chain_storage: file             # file | postgres
+  chain_path: data/audit/chain.jsonl
