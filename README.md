@@ -12,7 +12,7 @@
 
 It is designed around a practical industrial principle: **detecting a problem is not the same as being authorized to act on it**. FactoryMind separates anomaly detection, root-cause analysis (RCA), safety-policy evaluation, action execution, and audit recording into explicit components.
 
-> **Project scope:** The implementation uses a digital-twin-style simulator and synthetic telemetry. It is a portfolio/reference implementation for industrial AI, predictive maintenance, reliability engineering, and governed-agent workflows. It is not connected to a real factory by default and is not a certified safety system.
+> **Project scope:** The implementation uses a digital-twin-style simulator and synthetic telemetry. It is a reference implementation for industrial AI, predictive maintenance, reliability engineering, and governed-agent workflows. It is not connected to a real factory by default and is not a certified safety system.
 
 ---
 
