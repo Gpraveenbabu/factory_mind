@@ -1,334 +1,804 @@
-# FactoryMind — What Was Built & How to Run It Locally
 
-## Part 1: What Was Built (Step by Step)
+# FactoryMind — Project Guide
 
-FactoryMind is an industrial AI platform that monitors machines, detects problems, finds the cause, and takes safe action — all without letting an AI directly control machinery. Here is what was built, in the order it was built:
+**An industrial AI platform for equipment monitoring, anomaly detection, root-cause analysis, and controlled operational decision-making.**
 
-### Step 1 — Project Scaffolding
+FactoryMind is designed around a deterministic industrial decision core. It combines simulated equipment signals, detection logic, root-cause analysis (RCA), policy evaluation, controlled tool execution, and audit records.
 
-Created the folder structure, `pyproject.toml` (lists dependencies like numpy, pandas, scipy, scikit-learn, pydantic), a `Makefile` with common commands (test, lint, format), and a `configs/default.yaml` with sensor ranges, detection thresholds, and policy settings.
+The project emphasizes a key engineering principle: **AI can help interpret industrial conditions, but operational actions should pass through explicit policies and controlled execution paths.**
 
-### Step 2 — Domain Layer (`factorymind/domain/`)
-
-Defined the core vocabulary of the system:
-- **Enums** (`enums.py`): Machine states, health states, failure modes (bearing degradation, thermal overload, cooling failure, etc.), risk levels, sensor names, anomaly types, audit event types, tool names, policy decisions.
-- **Models** (`models.py`): Frozen dataclasses for every entity — SensorReading, TelemetrySnapshot (one reading from all 9 sensors at a single moment), MachineConfig, MachineRuntimeState, Anomaly, FeatureVector, EvidenceItem, RootCauseResult, PolicyDecisionResult, ApprovalRequest, ToolExecutionResult, AuditEvent, Incident.
-
-### Step 3 — Simulation Layer (`factorymind/simulation/`)
-
-Built a digital twin of an industrial machine so we can generate realistic sensor data without real hardware:
-- **Sensors** (`sensors.py`): 9 sensors (temperature, vibration, pressure, motor current, RPM, load, coolant temperature, coolant flow, acoustic level). Each has nominal ranges, noise, and configurable quality faults (drift, dropout, stuck-at, outliers).
-- **Failures** (`failures.py`): 7 failure modes, each with a distinct temporal signature. For example, bearing degradation grows exponentially over time; thermal overload follows a sigmoid curve; sudden bearing failure is a step change.
-- **Machine** (`machine.py`): The MachineSimulator combines sensors + a failure profile. You call `step()` to get one TelemetrySnapshot, `inject_failure()` to start a failure, and `run()` to simulate a full time series. It tracks degradation score, health state, and failure progress.
-- **Scenarios** (`scenarios.py`): 11 predefined scenarios (healthy machine, gradual bearing degradation, sudden bearing failure, thermal overload, cooling failure, mechanical imbalance, motor overload, sensor dropout, sensor drift, sensor stuck). Each has expected outcomes for testing.
-
-### Step 4 — Ingestion Layer (`factorymind/ingestion/`)
-
-Built the pipeline that receives telemetry data and validates it:
-- **Validation** (`validation.py`): Checks that all 9 sensors are present, values are within plausible ranges, not too many NaNs, and no contradictory readings (e.g., high RPM but zero current).
-- **Pipeline** (`pipeline.py`): A rolling buffer that ingests snapshots, validates them, and emits events. In Phase 1, events are handled by in-process callbacks. This is designed to be swapped for Kafka later.
-
-### Step 5 — Feature Engineering (`factorymind/features/`)
-
-Built three feature engines that transform raw readings into signals the detector can use:
-- **Rolling** (`rolling.py`): Computes rolling mean, std, min, max, EWMA (exponentially weighted moving average), and lag features over a configurable window.
-- **Temporal** (`temporal.py`): Fits a least-squares slope to recent readings to detect whether a sensor is trending up, trending down, or stable.
-- **Correlations** (`correlations.py`): Tracks pairs of sensors that normally move together (e.g., temperature and vibration). If one sensor spikes but its partner doesn't, that's a correlation deviation — a strong signal for sensor faults vs real failures.
-
-### Step 6 — Detection Layer (`factorymind/detection/`)
-
-- **Rules** (`rules.py`): A rule-based detector that uses rolling features and temporal features to detect anomalies. Each sensor has warn and critical thresholds (from config). It can optionally require trend confirmation (a single spike above threshold is not enough; the sensor must also be trending). This reduces false alarms.
-
-### Step 7 — Root Cause Analysis Engine (`factorymind/rca/`)
-
-Built a deterministic RCA engine — no LLM in the reasoning loop:
-- **Signatures** (`signatures.py`): Each failure mode has a signature — which sensors are primary, which are secondary, what trends are expected, and which sensor pairs should correlate. For example, bearing degradation signature: primary = vibration, secondary = temperature and motor current.
-- **Evidence** (`evidence.py`): Collects all available evidence — threshold anomalies, trend directions, correlation deviations, and contradiction pairs. Contradictions help distinguish sensor faults from real failures.
-- **Engine** (`engine.py`): Matches the evidence against each failure signature using fixed confidence weights: primary sensor match +0.3, secondary +0.15, trend match +0.1, contradiction penalty -0.2. The highest-scoring failure mode wins. Sensor faults get special detection: one sensor anomalous + normal partner + contradiction = sensor fault, not real failure.
-
-### Step 8 — Policy Engine (`factorymind/policy/`)
-
-Built a deterministic safety policy — the AI agent can never bypass this:
-- **Permissions** (`permissions.py`): Each tool has a permission level: SYSTEM (always allowed), OPERATOR, SUPERVISOR, or DENIED. Read-only tools (get status, get history) are auto-approved. Action tools (reduce load, shutdown) require human approval.
-- **Rules** (`rules.py`): 8 rules evaluated in order. If a machine is shut down, all actions are blocked. If under maintenance, all actions are blocked. Read-only tools always allowed. Schedule inspection allowed if degradation >= 0.2. Reduce load requires operator approval and degradation >= 0.5. Shutdown requires supervisor approval and SEVERE/CRITICAL risk. Default deny.
-- **Engine** (`engine.py`): A stateless evaluator that takes a policy context and returns an allow, deny, or needs-approval decision.
-
-### Step 9 — Tools Layer (`factorymind/tools/`)
-
-Built the execution layer — the only path to affect machines:
-- **Schemas** (`schemas.py`): Tool definitions with name, description, risk level, required permission, input schema, and a handler function. Includes input validation.
-- **Machine Tools** (`machine_tools.py`): 6 handler functions: get_machine_status, get_sensor_history, schedule_inspection, reduce_machine_load, shutdown_machine, request_human_approval. Uses in-memory state for Phase 1.
-- **Registry** (`registry.py`): Registers all 6 tools and provides lookup.
-- **Broker** (`broker.py`): The ToolBroker is the single execution path. It: (1) checks the tool exists, (2) validates the input, (3) evaluates the policy, (4) checks approval status, (5) executes the handler, (6) writes an audit event. If any step fails, execution is denied.
-
-### Step 10 — Audit Chain (`factorymind/audit/`)
-
-Built a tamper-evident audit log — every action is recorded and chained:
-- **Events** (`events.py`): AuditEvent dataclass with event type, timestamp, actor, tool name, input, output, policy decision, and a previous hash link.
-- **Chain** (`chain.py`): A hash-chained ledger. Each event's hash includes the previous event's hash, so tampering with any entry breaks the chain. Supports append, query, and export.
-- **Verification** (`verification.py`): Walks the chain and verifies every hash link. If any event was modified, verification fails and reports which event was tampered with.
-
-### Step 11 — Dataset Generation Script (`scripts/generate_dataset.py`)
-
-A CLI script that runs the machine simulator across multiple machines and scenarios, generates synthetic telemetry datasets, and saves them as CSV files for training and testing.
-
-### Step 12 — Unit Tests (`tests/unit/`)
-
-7 test files covering every layer:
-- `test_simulator.py` — tests sensor generation, failure injection, scenarios
-- `test_features.py` — tests rolling windows, temporal trends, correlations
-- `test_detection.py` — tests threshold detection, trend confirmation
-- `test_rca.py` — tests signature matching, confidence scoring, sensor fault detection
-- `test_policy.py` — tests all 8 policy rules, approval flow
-- `test_tools.py` — tests tool registry, broker execution, denial paths
-- `test_audit.py` — tests chain integrity, tamper detection, verification
-
-### Step 13 — Integration Test (`tests/integration/test_vertical_slice.py`)
-
-A full end-to-end test: simulate a machine → ingest telemetry → extract features → detect anomalies → run RCA → evaluate policy → execute a tool via the broker → verify the audit chain records everything correctly.
+This guide helps developers understand the architecture, run the available functionality, inspect outputs, test the core, and identify future extensions.
 
 ---
 
-## Part 2: How to Run It on Your Local Device
+## Table of Contents
 
-### Prerequisites
+1. [Project Overview](#1-project-overview)
+2. [Core Concepts](#2-core-concepts)
+3. [Architecture](#3-architecture)
+4. [Requirements](#4-requirements)
+5. [Installation](#5-installation)
+6. [Run the Project](#6-run-the-project)
+7. [Understand the Outputs](#7-understand-the-outputs)
+8. [How the Decision Pipeline Works](#8-how-the-decision-pipeline-works)
+9. [Policy and Tool Execution](#9-policy-and-tool-execution)
+10. [Auditability](#10-auditability)
+11. [Run Tests](#11-run-tests)
+12. [Project Structure](#12-project-structure)
+13. [Troubleshooting](#13-troubleshooting)
+14. [Safety and Limitations](#14-safety-and-limitations)
+15. [Roadmap](#15-roadmap)
 
-- Python 3.11 or higher
-- pip (comes with Python)
-- Git (to clone the project)
+---
 
-### Step 1: Get the Code
+## 1. Project Overview
 
-```bash
-git clone <your-repo-url> factorymind
-cd factorymind
+Industrial environments generate large amounts of telemetry. Engineers need to detect abnormal conditions, understand their likely causes, and decide what action should be taken.
+
+FactoryMind explores how to organize these steps into a testable, auditable software system.
+
+### The problem
+
+A basic monitoring system might report that a machine's temperature has exceeded a threshold. That alone does not answer:
+
+- Is the condition genuinely abnormal?
+- What other signals changed at the same time?
+- What is the likely root cause?
+- Is an intervention permitted?
+- Which component requested or approved the action?
+- Can the decision be reconstructed later?
+
+FactoryMind separates these responsibilities into individual components.
+
+### Project objectives
+
+- Simulate industrial equipment signals.
+- Detect abnormal operating conditions.
+- Generate structured root-cause hypotheses.
+- Evaluate proposed actions against explicit policies.
+- Route permitted actions through a controlled tool broker.
+- Record relevant decisions and execution outcomes in an audit chain.
+- Provide a foundation for future industrial AI agents.
+
+### Intended users
+
+- Industrial AI and machine-learning developers.
+- Software engineers working on industrial monitoring.
+- Researchers studying explainable decision pipelines.
+- Developers interested in tool-using AI agents with operational controls.
+- Engineers building prototypes for predictive maintenance and root-cause analysis.
+
+FactoryMind is a prototype and should not be treated as a certified industrial control system.
+
+---
+
+## 2. Core Concepts
+
+### 2.1 Simulator
+
+The simulator generates equipment signals or operating scenarios so that the pipeline can be exercised without requiring a live industrial machine.
+
+It provides a repeatable way to explore normal and abnormal conditions.
+
+### 2.2 Detection
+
+The detection component evaluates incoming signals and identifies conditions that may require investigation.
+
+Examples of industrial signals include temperature, vibration, pressure, and operating load. The exact signals and detection rules depend on the implementation.
+
+### 2.3 Root-Cause Analysis
+
+Root-cause analysis attempts to explain an observed anomaly by evaluating available evidence.
+
+A useful RCA result should distinguish:
+
+- The detected symptom.
+- The supporting evidence.
+- The proposed cause or causes.
+- Confidence or uncertainty, where implemented.
+- The next recommended investigation or action.
+
+A proposed root cause is not automatically proof of the physical cause of a failure.
+
+### 2.4 Policy Engine
+
+The policy engine evaluates whether a proposed action satisfies the project's explicit operational rules.
+
+Policy decisions should be separate from the model's recommendation. A model suggesting an action does not, by itself, authorize that action.
+
+### 2.5 Tool Broker
+
+The tool broker provides a controlled boundary between decision logic and executable tools.
+
+Instead of allowing arbitrary components to execute operations directly, requests can be routed through a defined interface where permissions and validation are applied.
+
+### 2.6 Audit Chain
+
+The audit component records relevant events and decisions so they can be reviewed later.
+
+The goal is to make it possible to trace how a system reached a decision and what happened when a tool request was processed.
+
+---
+
+## 3. Architecture
+
+FactoryMind's core vertical slice follows this conceptual flow:
+
+```text
+Industrial Scenario
+        |
+        v
+     Simulator
+        |
+        v
+   Signal / State
+        |
+        v
+    Detection
+        |
+        v
+Root-Cause Analysis
+        |
+        v
+  Policy Evaluation
+        |
+        v
+    Tool Broker
+        |
+        v
+ Controlled Tool Result
+        |
+        v
+    Audit Chain
 ```
 
-If you don't have a git repo yet, just copy the `factorymind/` folder to your local machine.
+The exact data structures and call order should be confirmed against the current implementation.
 
-### Step 2: Create a Virtual Environment
+### Component responsibilities
+
+| Component | Responsibility |
+|---|---|
+| Simulator | Produces repeatable equipment scenarios |
+| Detection | Identifies abnormal conditions |
+| RCA | Analyzes evidence and proposes possible causes |
+| Policy | Determines whether a proposed operation is allowed |
+| Tool broker | Controls requests to supported tools |
+| Audit chain | Records relevant decisions and outcomes |
+
+### Why separate these components?
+
+Separation improves:
+
+- **Testability:** each component can be validated independently.
+- **Explainability:** detection evidence and proposed causes can be inspected.
+- **Safety:** policy checks can be applied before controlled operations.
+- **Maintainability:** components can evolve without requiring a complete rewrite.
+- **Traceability:** decisions and execution outcomes can be associated with audit records.
+
+### Deterministic core
+
+The deterministic core is the first priority for FactoryMind.
+
+The objective is to make the operational flow predictable and testable before introducing additional agent services, dashboards, or distributed infrastructure.
+
+This does not mean every external dependency is automatically deterministic. Simulator inputs, configuration, tool responses, and execution environments can still affect results.
+
+---
+
+## 4. Requirements
+
+Use the versions and dependencies specified by the current repository.
+
+Typical requirements for a Python implementation include:
+
+- Python compatible with the project's dependency definitions.
+- A virtual environment.
+- Git.
+- The libraries listed in the repository's dependency files.
+
+The exact minimum Python version, package versions, and optional service requirements should be taken from the actual project configuration rather than guessed.
+
+---
+
+## 5. Installation
+
+### Step 1: Clone the repository
 
 ```bash
-python3.11 -m venv .venv
+git clone <YOUR_FACTORYMIND_REPOSITORY_URL>
+cd FactoryMind
+```
+
+Replace the placeholder with your actual repository URL. Use the repository's actual directory name if it differs.
+
+### Step 2: Create a virtual environment
+
+```bash
+python3 -m venv .venv
+```
+
+Activate it on Linux or macOS:
+
+```bash
 source .venv/bin/activate
 ```
 
-On Windows:
-```bash
-python -m venv .venv
-.venv\Scripts\activate
+On Windows PowerShell:
+
+```powershell
+.venv\Scripts\Activate.ps1
 ```
 
-### Step 3: Install Dependencies
+### Step 3: Install dependencies
 
-```bash
-pip install -e ".[dev]"
-```
-
-This installs the FactoryMind package in editable mode plus all development tools (pytest, ruff, mypy). If you only want the core package:
+If the repository includes `requirements.txt`:
 
 ```bash
-pip install -e .
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-### Step 4: Verify the Installation
+If the project uses `pyproject.toml` or another dependency manager, follow the installation instructions defined in that file.
+
+### Step 4: Inspect the repository
+
+Before running a command, inspect the available entry points and tests:
 
 ```bash
-python -c "import factorymind; print('FactoryMind installed successfully')"
+find . -maxdepth 3 -type f | sort
 ```
 
-### Step 5: Run the Tests
+Look for:
 
-```bash
-# Run all tests
-pytest tests/ -v
+- A documented demo or example.
+- The simulator entry point.
+- The main pipeline or orchestration module.
+- The policy and tool-broker implementations.
+- The audit implementation.
+- Test files and configuration files.
 
-# Run tests with coverage report
-pytest tests/ -v --cov=factorymind --cov-report=term-missing
-
-# Run only unit tests
-pytest tests/unit/ -v
-
-# Run only the integration test
-pytest tests/integration/ -v
-
-# Run a specific test file
-pytest tests/unit/test_simulator.py -v
-```
-
-### Step 6: Run the Linter and Type Checker
-
-```bash
-# Lint
-ruff check factorymind/ tests/
-
-# Format check
-ruff format --check factorymind/ tests/
-
-# Auto-format
-ruff format factorymind/ tests/
-
-# Type check
-mypy factorymind/
-```
-
-### Step 7: Generate a Synthetic Dataset
-
-```bash
-python scripts/generate_dataset.py --config configs/default.yaml --output data/synthetic/
-```
-
-This will create CSV files with simulated machine telemetry for all scenarios.
-
-### Step 8: Run a Quick Demo
-
-```python
-python -c "
-from factorymind.simulation.scenarios import get_demo_scenario
-from factorymind.simulation.machine import MachineSimulator
-from factorymind.ingestion.pipeline import IngestionPipeline
-from factorymind.detection.rules import RuleDetector
-from factorymind.rca.engine import RCAEngine
-from factorymind.policy.engine import PolicyEngine
-from factorymind.tools.broker import ToolBroker
-from factorymind.tools.registry import ToolRegistry
-from factorymind.audit.chain import AuditChain
-
-# 1. Pick a scenario
-scenario = get_demo_scenario()
-sim = MachineSimulator(config=scenario.machine_config)
-sim.inject_failure(scenario.failure_mode, severity=0.7)
-
-# 2. Ingest 200 steps of telemetry
-pipeline = IngestionPipeline()
-for _ in range(200):
-    snapshot = sim.step()
-    pipeline.ingest(snapshot)
-
-# 3. Detect anomalies
-detector = RuleDetector()
-recent = pipeline.get_recent(sim.machine_id, n=20)
-anomalies = detector.detect(recent)
-print(f'Detected {len(anomalies)} anomalies')
-for a in anomalies:
-    print(f'  {a.sensor_name}: {a.anomaly_type} (severity={a.severity})')
-
-# 4. Root cause analysis
-rca = RCAEngine()
-result = rca.analyze(anomalies, recent, sim.machine_id)
-print(f'Root cause: {result.failure_mode} (confidence={result.confidence:.2f})')
-print(f'  Health: {result.health_state}')
-print(f'  Risk: {result.risk_level}')
-
-# 5. Policy + execution
-registry = ToolRegistry()
-chain = AuditChain()
-broker = ToolBroker(registry=registry, policy_engine=PolicyEngine(), audit_chain=chain)
-exec_result = broker.request_execution(
-    tool_name='get_machine_status',
-    input_data={'machine_id': sim.machine_id},
-    actor='system',
-    context={'degradation_score': result.confidence},
-)
-print(f'Tool execution: {exec_result.status}')
-print(f'Audit chain has {len(chain.events)} events')
-print('Chain valid:', chain.verify())
-"
-```
-
-### Using Make (Optional)
-
-If you have `make` installed, you can use these shortcuts:
-
-```bash
-make install    # Install dependencies
-make test       # Run tests
-make test-cov   # Run tests with coverage
-make lint       # Lint and format check
-make format     # Auto-format code
-make typecheck   # Type check
-make clean      # Remove cache files
-```
-
-> **Note:** The Makefile was saved as `Makefile.py`. If you want to use `make` commands, rename it to `Makefile` (no extension) on your local machine:
-> ```bash
-> mv Makefile.py Makefile
-> ```
+The correct command depends on the actual entry point provided by your checkout.
 
 ---
 
-## Project Structure
+## 6. Run the Project
 
-```
-factorymind/
-├── pyproject.toml              # Package config, dependencies, tool settings
-├── Makefile.py                 # Build commands (rename to Makefile locally)
-├── configs/
-│   └── default.yaml            # Sensor ranges, thresholds, policy settings
-├── scripts/
-│   └── generate_dataset.py     # Synthetic data generation CLI
-├── factorymind/                # The main Python package
-│   ├── domain/                 # Core types (enums, dataclasses)
-│   ├── simulation/             # Digital twin (sensors, failures, machine, scenarios)
-│   ├── ingestion/              # Validation + buffering pipeline
-│   ├── features/               # Rolling, temporal, correlation features
-│   ├── detection/              # Rule-based anomaly detector
-│   ├── rca/                    # Root cause analysis (signatures, evidence, engine)
-│   ├── policy/                 # Safety policy (permissions, rules, engine)
-│   ├── tools/                  # Execution layer (schemas, tools, registry, broker)
-│   └── audit/                  # Hash-chained audit log (events, chain, verification)
-└── tests/
-    ├── conftest.py            # Shared pytest fixtures
-    ├── unit/                   # 7 unit test files (one per layer)
-    └── integration/            # End-to-end vertical slice test
-```
+FactoryMind's core workflow is intended to demonstrate the path from an equipment scenario to a controlled, auditable decision.
 
----
+Because entry-point names and constructor signatures depend on the repository version, use the actual demo script or command documented by the project. Do not assume that a particular CLI or API exists unless it is implemented.
 
-## Key Design Principles
+### Recommended first run
 
-1. **Perception ≠ Reasoning ≠ Authority ≠ Execution** — The AI agent observes and reasons, but a deterministic policy engine decides what is allowed, and the ToolBroker is the only path to act on machines.
-2. **Deterministic RCA** — Root cause analysis uses fixed confidence weights, not an LLM. This makes results reproducible and auditable.
-3. **Sensor faults vs real failures** — Correlation analysis distinguishes a broken sensor from a broken machine. If one sensor spikes but its normal partner doesn't, it's a sensor fault.
-4. **Tamper-evident audit** — Every action is hash-chained. Modifying any event breaks the chain and is immediately detectable.
-5. **Pure Python core** — No pandas or Spark in the domain logic. This keeps everything fast, testable, and framework-agnostic.
+1. Activate the virtual environment.
+2. Load the project's supported configuration.
+3. Run the available simulator or demo.
+4. Inspect the generated signals.
+5. Review detection results.
+6. Inspect the RCA result.
+7. Review the policy decision.
+8. Inspect the tool-broker outcome.
+9. Examine the audit records.
+10. Run the test suite.
+
+### What should you look for?
+
+A useful end-to-end demonstration should make the relationship between the stages visible:
+
+- Which input scenario was evaluated?
+- Which condition was detected?
+- What evidence supported the RCA result?
+- What action was proposed?
+- Was the action allowed or denied?
+- What did the tool broker return?
+- What information was recorded in the audit trail?
+
+The exact output fields and successful execution sequence should be verified against the implementation.
 
 ---
 
-## Test Results
+## 7. Understand the Outputs
 
-All **86 tests pass** — 7 unit test files + 1 integration test file:
+The examples in this section are **illustrative schemas**, not captured FactoryMind execution results. Actual field names, values, and serialization depend on the current code.
 
+### 7.1 Simulated equipment state
+
+A simulator may represent a machine's operating conditions using structured telemetry.
+
+Illustrative example:
+
+```json
+{
+  "equipment_id": "pump-01",
+  "temperature_c": 92.4,
+  "vibration_mm_s": 8.1,
+  "operating_state": "running"
+}
 ```
-============================== 86 passed in 1.16s ==============================
+
+This example shows the kind of information an industrial scenario could contain. It does not establish that the current simulator emits these exact fields.
+
+### 7.2 Detection result
+
+The detection stage identifies a condition that warrants attention.
+
+Illustrative example:
+
+```json
+{
+  "anomaly_detected": true,
+  "severity": "high",
+  "signals": [
+    "temperature",
+    "vibration"
+  ]
+}
 ```
 
-### Test Breakdown
+The purpose is to represent a detected condition and its evidence. The actual detection thresholds and severity categories must be taken from the source code or configuration.
 
-| Test File | Tests | What It Covers |
-| --- | --- | --- |
-| `test_simulator.py` | 13 | Sensor generation, failure injection, degradation, health transitions, scenarios |
-| `test_features.py` | 12 | Rolling windows, temporal trends, correlation features |
-| `test_detection.py` | 7 | Threshold detection, trend confirmation, severity levels |
-| `test_rca.py` | 7 | Signature matching, confidence scoring, sensor fault detection, evidence |
-| `test_policy.py` | 14 | All 8 policy rules, approval flow, shutdown, deny paths |
-| `test_tools.py` | 16 | Tool registry, broker execution, denial paths, audit, input validation |
-| `test_audit.py` | 10 | Chain integrity, tamper detection, verification, export |
-| `test_vertical_slice.py` | 3 | Full end-to-end: simulate → detect → RCA → policy → execute → audit |
-| **Total** | **86** | |
+### 7.3 Root-cause analysis result
+
+RCA should connect a detected symptom with supporting evidence and a proposed explanation.
+
+Illustrative example:
+
+```json
+{
+  "suspected_cause": "bearing_degradation",
+  "supporting_evidence": [
+    "elevated_vibration",
+    "increased_temperature"
+  ],
+  "recommended_action": "inspect_bearing"
+}
+```
+
+This is an example of a structured RCA result, not a validated diagnosis. Real industrial root-cause analysis requires appropriate sensor data, validation, and engineering review.
+
+### 7.4 Policy decision
+
+The policy stage evaluates a proposed action.
+
+Illustrative example:
+
+```json
+{
+  "action": "inspect_bearing",
+  "decision": "allowed",
+  "reason": "action_matches_configured_policy"
+}
+```
+
+The actual policy may allow, deny, or otherwise classify a request. Use the implemented decision model to determine its exact vocabulary and fields.
+
+### 7.5 Tool-broker result
+
+The broker mediates an operation and returns its outcome.
+
+Illustrative example:
+
+```json
+{
+  "tool": "maintenance_ticket",
+  "status": "completed",
+  "operation_id": "op-001"
+}
+```
+
+This example does not mean FactoryMind currently integrates with a real maintenance-ticket system. Only document a real integration when the corresponding tool is implemented and tested.
+
+### 7.6 Audit record
+
+An audit record can associate an input, decision, action request, or result with a traceable record.
+
+Illustrative example:
+
+```json
+{
+  "event_type": "policy_decision",
+  "action": "inspect_bearing",
+  "decision": "allowed",
+  "recorded": true
+}
+```
+
+The actual audit implementation determines the recorded fields and whether it uses hashing, chained records, or another integrity mechanism.
 
 ---
 
-## Troubleshooting
+## 8. How the Decision Pipeline Works
 
-**`ModuleNotFoundError: No module named 'factorymind'`**
-→ Run `pip install -e .` from the project root.
+### Step 1: Generate a scenario
 
-**`pytest` not found**
-→ Run `pip install -e ".[dev]"` to install test dependencies.
+The simulator produces an input state for the pipeline.
 
-**Python version too old**
-→ FactoryMind requires Python 3.11+. Check with `python --version`.
+For repeatable tests, the same scenario and configuration should produce comparable outputs. If randomness is involved, use the simulator's supported seed mechanism if available.
 
-**Tests fail with import errors**
-→ Make sure you're in the `factorymind/` directory and the virtual environment is active.
+### Step 2: Detect an abnormal condition
+
+The detection component evaluates the input using the rules or models implemented in the project.
+
+The result should preserve enough evidence for downstream analysis.
+
+### Step 3: Analyze possible causes
+
+RCA evaluates the available evidence and produces a proposed explanation.
+
+Keep the distinction between evidence and hypothesis clear. A detected correlation does not necessarily prove causation.
+
+### Step 4: Propose an action
+
+Based on the condition and RCA result, the system can produce a recommended next step.
+
+Recommendations should remain distinct from execution requests.
+
+### Step 5: Evaluate policy
+
+The policy engine checks whether the requested operation satisfies the configured rules.
+
+A denied action should not proceed to a protected execution path.
+
+### Step 6: Route through the tool broker
+
+Permitted requests are routed through the broker and handled by supported tools.
+
+The broker should validate requests at its boundary instead of relying solely on upstream components to behave correctly.
+
+### Step 7: Record the outcome
+
+Relevant events, policy decisions, and tool outcomes are recorded in the audit mechanism.
+
+The complete trace helps developers understand what happened and investigate unexpected behavior.
+
+---
+
+## 9. Policy and Tool Execution
+
+Policy enforcement is a core design principle of FactoryMind.
+
+### Recommended execution boundary
+
+```text
+Recommendation
+      |
+      v
+Policy Evaluation
+      |
+      +---- Denied ----> Record decision
+      |
+      v
+   Allowed
+      |
+      v
+  Tool Broker
+      |
+      v
+Validate and Execute
+      |
+      v
+Record Outcome
+```
+
+This diagram expresses the intended control flow. Verify the precise enforcement sequence in the actual implementation.
+
+### Policy design principles
+
+- Validate requested actions before execution.
+- Use explicit allow/deny rules.
+- Reject unsupported or malformed requests.
+- Apply least-privilege access to tools.
+- Keep policy decisions separate from model-generated recommendations.
+- Record denials as well as successful operations where supported.
+- Treat timeouts and tool failures as distinct from successful execution.
+
+### Tool broker design principles
+
+- Expose a limited set of supported operations.
+- Validate tool arguments.
+- Avoid unrestricted shell or arbitrary-code execution.
+- Handle failures explicitly.
+- Return structured outcomes.
+- Preserve traceability between the request and its result.
+
+**Important:** Do not connect a prototype broker to live industrial equipment without a separate safety review, authorization design, failure analysis, and appropriate operational safeguards.
+
+---
+
+## 10. Auditability
+
+Auditability helps developers reconstruct a decision after execution.
+
+A useful audit trail should make it possible to identify:
+
+- The relevant scenario or input.
+- The detection outcome.
+- The RCA result.
+- The proposed action.
+- The policy decision.
+- The tool request and execution outcome.
+- Any associated errors.
+
+### Audit integrity
+
+If the implementation uses hash-linked records, the integrity of the chain depends on how records are serialized, hashed, linked, stored, and verified.
+
+A hash chain can make certain modifications detectable, but it does not automatically guarantee:
+
+- Protection against every privileged attacker.
+- Durable storage.
+- Correct timestamps.
+- Confidentiality.
+- Authenticity of every event source.
+- Correctness of the underlying industrial decision.
+
+Document only the integrity properties that the current code and tests demonstrate.
+
+---
+
+## 11. Run Tests
+
+Run the tests from the repository root using the project's configured test runner.
+
+For a Python project using pytest:
+
+```bash
+python -m pytest -v
+```
+
+If the project organizes tests in a dedicated directory:
+
+```bash
+python -m pytest tests/ -v
+```
+
+Use the path that actually exists in your checkout.
+
+### Test the deterministic core
+
+The core vertical slice should have tests for:
+
+- Simulator behavior.
+- Detection logic.
+- RCA output and evidence handling.
+- Policy allow/deny decisions.
+- Tool-broker validation and failure handling.
+- Audit record creation.
+- Audit integrity verification, if implemented.
+- End-to-end execution across the core components.
+
+### Verify the result
+
+After running tests, record:
+
+- The command used.
+- The number of passed and failed tests.
+- Any skipped tests.
+- The environment and dependency versions.
+- Whether tests exercised only mocks/simulations or external integrations.
+
+Do not publish a fixed test count unless it matches the latest run.
+
+---
+
+## 12. Project Structure
+
+The following is a conceptual structure based on the FactoryMind core architecture. Treat it as an organizational guide rather than an assertion that every path already exists.
+
+```text
+FactoryMind/
+├── simulator/
+│   └── equipment scenarios
+├── detection/
+│   └── anomaly detection logic
+├── rca/
+│   └── root-cause analysis
+├── policy/
+│   └── action authorization rules
+├── tool_broker/
+│   └── controlled tool execution
+├── audit/
+│   └── decision and execution records
+├── tests/
+│   └── unit and integration tests
+├── docs/
+│   └── PROJECT_GUIDE.md
+├── README.md
+└── project configuration and dependency files
+```
+
+The actual repository may use different paths or combine some components into shared packages.
+
+### Where should a new contributor start?
+
+1. Find the simulator and understand its input format.
+2. Follow one scenario through the detection component.
+3. Inspect how evidence is passed into RCA.
+4. Review policy evaluation and its tests.
+5. Inspect the tool-broker boundary.
+6. Trace how decisions and results reach the audit mechanism.
+7. Run the relevant unit tests before changing a component.
+
+---
+
+## 13. Troubleshooting
+
+### Import errors
+
+**Possible cause:** The package is not installed or the project root is not on Python's import path.
+
+**Try:**
+
+```bash
+python -m pip install -e .
+```
+
+Use this only if the repository supports editable installation through its packaging configuration.
+
+Otherwise, follow the repository's actual setup instructions.
+
+### Dependencies fail to install
+
+**Possible cause:** Unsupported Python versions, conflicting dependencies, or platform-specific packages.
+
+**Try:**
+
+- Check the Python version required by the project.
+- Create a fresh virtual environment.
+- Follow the dependency files in the repository.
+- Avoid mixing dependencies from unrelated environments.
+
+### The pipeline produces no anomaly
+
+**Possible cause:** The input scenario does not cross the configured thresholds or satisfy the detection rules.
+
+**Try:**
+
+- Inspect the simulator output.
+- Check the detection configuration.
+- Verify units and expected signal ranges.
+- Run a known test scenario.
+- Review the detection tests before changing thresholds.
+
+### An action is denied
+
+**Possible cause:** The policy engine rejected the request or the request did not satisfy the configured requirements.
+
+**Try:**
+
+- Inspect the policy decision and reason.
+- Check the requested action and its arguments.
+- Verify the active policy configuration.
+- Do not bypass the policy merely to make the demo succeed.
+
+### Tool execution fails
+
+**Possible cause:** Invalid arguments, an unsupported operation, a timeout, or a tool error.
+
+**Try:**
+
+- Inspect the broker response.
+- Verify the tool is registered and supported.
+- Confirm request validation.
+- Check whether the failure was recorded.
+- Test failure paths using safe test doubles.
+
+### Audit verification fails
+
+**Possible cause:** A record was altered, the chain was constructed inconsistently, or serialization/hash inputs differ.
+
+**Try:**
+
+- Inspect the audit verification output.
+- Check canonical serialization and record ordering.
+- Confirm the same hashing rules are used when creating and verifying records.
+- Use a minimal reproducible test.
+
+Do not assume an audit verification failure is harmless.
+
+---
+
+## 14. Safety and Limitations
+
+FactoryMind is a software prototype for industrial AI workflows.
+
+### Current scope
+
+The primary focus is the deterministic core:
+
+- Simulator
+- Detection
+- Root-cause analysis
+- Policy evaluation
+- Tool broker
+- Audit chain
+
+The exact level of completion for each component should be verified against the current source code and tests.
+
+### Important limitations
+
+- Simulated equipment behavior does not prove performance on real machinery.
+- Anomaly detection does not necessarily identify the true physical cause.
+- RCA results should be treated as hypotheses unless independently validated.
+- Policy rules can be incomplete or incorrectly configured.
+- Tool-broker controls require testing against invalid inputs and failure scenarios.
+- Audit records do not prove that an underlying decision was correct.
+- Prototype software is not a replacement for industrial safety systems or qualified engineering review.
+
+### Before any real deployment
+
+- Validate against representative industrial data.
+- Define access controls and authentication.
+- Test policy bypass and malformed-request scenarios.
+- Review failure modes and recovery behavior.
+- Define audit retention, access, and integrity requirements.
+- Establish human approval for consequential operations.
+- Conduct a safety and security assessment.
+- Keep the prototype isolated from live control systems until formally approved.
+
+---
+
+## 15. Roadmap
+
+The checklist distinguishes core functionality from possible future extensions.
+
+### Core deterministic vertical slice
+
+- [x] Equipment simulation
+- [x] Detection component
+- [x] Root-cause analysis component
+- [x] Policy evaluation
+- [x] Controlled tool-broker boundary
+- [x] Audit-chain component
+- [x] Unit and integration testing for the core
+
+**Verification note:** The checked items describe the intended core scope. Confirm the current implementation and latest tests before presenting every item as production-ready.
+
+### Future platform extensions
+
+- [ ] Additional equipment simulators and scenarios
+- [ ] Richer detection models and validation datasets
+- [ ] Evidence-grounded RCA enhancements
+- [ ] Expanded policy rules and authorization controls
+- [ ] Additional tool adapters and integrations
+- [ ] Monitoring dashboard and operational UI
+- [ ] API layer for external clients
+- [ ] Persistent storage for events and audit records
+- [ ] Metrics, tracing, and observability
+- [ ] Containerized deployment and CI/CD
+- [ ] Evaluation on representative industrial data
+- [ ] Carefully controlled human approval workflows
+
+These are potential extensions, not claims that the corresponding services are already implemented.
+
+---
+
+## Contributing
+
+Contributions are welcome.
+
+Before submitting a change:
+
+1. Read the relevant component and its tests.
+2. Keep component interfaces explicit.
+3. Add tests for normal and failure cases.
+4. Preserve policy enforcement boundaries.
+5. Avoid direct tool execution that bypasses the broker.
+6. Ensure important decisions and failures remain traceable.
+7. Document configuration changes and new outputs.
+8. Report what has been tested and what remains unverified.
+
+---
+
+## License
+
+Add the actual project license here. Verify the licensing requirements of dependencies and any external models or datasets before redistributing them.
+
+---
+
+## Summary
+
+FactoryMind is organized around a controlled industrial decision pipeline: simulate, detect, analyze, evaluate policy, execute through a broker, and record the outcome.
+
+Start by running the deterministic core and its tests. Understand the interfaces between components before adding more services or integrating external systems.
+
+The long-term objective is an industrial AI platform that is explainable, testable, auditable, and designed with explicit operational controls.
